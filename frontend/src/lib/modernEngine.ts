@@ -11,7 +11,19 @@ import { ensurePlaybackAsset } from "./mediaCache";
 
 export type ModuleEngine = EngineDescriptor;
 
+export interface StoryChoice {
+  decisionId: number;
+  optionIndex: number;
+}
+
+export interface StoryPosition {
+  /** Displayed source line, or -1 before the first line. */
+  lineIndex: number;
+  selections: StoryChoice[];
+}
+
 export interface PlayerController {
+  start(): Promise<void>;
   advance(): Promise<void>;
   reset(): Promise<void>;
   setAuto(enabled: boolean): void;
@@ -20,6 +32,13 @@ export interface PlayerController {
   setVolume(volume: number): void;
   setUIVisible(visible: boolean): void;
   skip(): Promise<void>;
+  getPosition(): StoryPosition;
+  /** Fast-forward to a saved line, restoring decision choices. Returns a cancel fn. */
+  seekToLine(
+    target: number,
+    choices: StoryChoice[],
+    onUpdate: (update: { phase: "seeking" | "reached" | "missed" | "aborted"; reason?: string }) => void
+  ): () => void;
   state(): { state: string; auto: boolean; fastForward: boolean; line: number | null; speed: number; canSkip: boolean };
   dispose(): void;
 }
@@ -32,6 +51,12 @@ interface NativePlayer {
   getState(): string;
   getAutoPlayState(): { mode: string; buttonSpeedLevel: number };
   getDisplayedLineIndex(): number | null;
+  getLogPosition?(): { lineIndex: number | null; selections: StoryChoice[] };
+  seekToLine?(
+    target: number,
+    choices: ReadonlyMap<number, number>,
+    onUpdate: (update: { phase: "seeking" | "reached" | "missed" | "aborted"; reason?: string }) => void
+  ): () => void;
   setAutoPlayMode(mode: string): void;
   setAutoPlaySpeedLevel(level: number): void;
   canSkipNode(): boolean;
@@ -226,6 +251,68 @@ function installRouting(win: Window & typeof globalThis, metadata: Set<string>):
   };
 }
 
+export interface ManifestSession {
+  /** Parse one script and return its deduped asset URLs without decoding media. */
+  manifest(script: string): Promise<string[]>;
+  dispose(): void;
+}
+
+/**
+ * A persistent hidden engine realm for bulk manifest capture.
+ *
+ * The old path booted a fresh iframe (module graph + Pixi + bridge) for every
+ * story, which is the dominant cost of "cache all". The bridge's
+ * `loadContext`/`manifest` pair is stateless, so one realm can serve thousands
+ * of scripts. The caller owns the iframe and must dispose the session.
+ */
+export async function createManifestSession(opts: FrameBootOptions): Promise<ManifestSession> {
+  const descriptor = opts.bundle.module_engine;
+  if (!descriptor) throw new Error("清单会话需要新版 StoryPlayer 引擎");
+  const runtime = await prepareEngine(descriptor);
+  const win = opts.iframe.contentWindow as Window & typeof globalThis;
+  const doc = opts.iframe.contentDocument;
+  if (!win || !doc) throw new Error("PRTS 清单容器不可用");
+  doc.open();
+  doc.write('<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000}</style></head><body><div id="arkstage-stage"></div></body></html>');
+  doc.close();
+  Object.assign(win, { mw: { config: { get: () => null, values: { wgUserGroups: [] } } } });
+  captureIframe(win);
+  const metadata = new Set<string>();
+  installRouting(win, metadata);
+  const imports = doc.createElement("script");
+  imports.type = "importmap";
+  imports.textContent = JSON.stringify({ imports: Object.fromEntries(OFFICIAL_HOSTS.map((host) => [`https://${host}/`, `${PROXY_BASE}/${host}/`])) });
+  doc.head.append(imports);
+  for (const url of descriptor.stylesheet_urls) {
+    const link = doc.createElement("link");
+    link.rel = "stylesheet";
+    link.href = localUrl(url);
+    doc.head.append(link);
+  }
+  const importModule = (url: string) => win.eval(`import(${JSON.stringify(url)})`) as Promise<{ arkstageEngine: EngineBridge }>;
+  for (const url of descriptor.polyfill_urls) await importModule(localUrl(url));
+  const blob = win.URL.createObjectURL(new win.Blob([runtime.source], { type: "text/javascript" }));
+  let bridge!: EngineBridge;
+  try { bridge = (await importModule(blob)).arkstageEngine; }
+  finally { win.URL.revokeObjectURL(blob); }
+  let disposed = false;
+  return {
+    async manifest(script: string) {
+      if (disposed) throw new Error("清单会话已关闭");
+      const context = await bridge.loadContext(script);
+      const urls = bridge.manifest(context);
+      if (!Array.isArray(urls) || urls.length === 0) {
+        throw new Error("PRTS 新版引擎未生成资源清单");
+      }
+      return [...new Set(urls)].filter((url) => /^https?:\/\//i.test(url));
+    },
+    dispose() {
+      disposed = true;
+      opts.iframe.remove();
+    },
+  };
+}
+
 export async function bootModernEngineInFrame(opts: FrameBootOptions): Promise<FrameBootResult> {
   const checkpoint = async (stage: string, detail = "") => {
     if (opts.mode === "play" && !opts.isCancelled?.()) await playbackCheckpoint(opts.title, stage, detail);
@@ -311,9 +398,37 @@ export async function bootModernEngineInFrame(opts: FrameBootOptions): Promise<F
   let modes = createPlaybackModes(player);
   let releaseLineListener = player.onDisplayedLineChange?.(() => modes.reconcile());
   const controller: PlayerController = {
+    async start() {
+      host.querySelector("[data-start-prompt]")?.remove();
+      await player.start();
+    },
     async advance() {
       host.querySelector("[data-start-prompt]")?.remove();
       await (player.getState() === "idle" ? player.start() : player.advance());
+    },
+    getPosition() {
+      const position = player.getLogPosition?.();
+      if (position) {
+        return {
+          lineIndex: position.lineIndex ?? -1,
+          selections: (position.selections ?? []).map((selection) => ({
+            decisionId: selection.decisionId,
+            optionIndex: selection.optionIndex,
+          })),
+        };
+      }
+      return { lineIndex: player.getDisplayedLineIndex() ?? -1, selections: [] };
+    },
+    seekToLine(target, choices, onUpdate) {
+      if (!player.seekToLine) {
+        onUpdate({ phase: "missed", reason: "unsupported" });
+        return () => {};
+      }
+      return player.seekToLine(
+        target,
+        new Map(choices.map((choice) => [choice.decisionId, choice.optionIndex])),
+        onUpdate
+      );
     },
     async reset() {
       await checkpoint("reset");

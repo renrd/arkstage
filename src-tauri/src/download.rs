@@ -24,9 +24,10 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager as _};
 
-/// Default number of concurrent workers per job (jsd default). Configurable at
-/// runtime (D2).
-const DEFAULT_CONCURRENCY: usize = 4;
+/// Default number of concurrent workers per job. Full-library caching is
+/// latency-bound on PRTS' CDN, so a wider pool than the historical 4 is the
+/// single biggest wall-clock win. Still clamped to 32 in `set_concurrency`.
+const DEFAULT_CONCURRENCY: usize = 16;
 /// Minimum gap between progress events for one job, to avoid event storms.
 const PROGRESS_THROTTLE_MS: u128 = 150;
 /// How long a worker waits when the queue is momentarily empty but the producer

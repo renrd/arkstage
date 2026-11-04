@@ -33,11 +33,14 @@ export function useStoryIndex() {
   const [error, setError] = useState<string | null>(null);
   const { metadata } = useBookshelfMetadata();
   const index = useMemo(
-    () => (
-      rawIndex
-        ? regroupStoryIndex(rawIndex, metadata?.storylines ?? [], metadata?.fallbackCategory)
-        : null
-    ),
+    () => {
+      if (!rawIndex) return null;
+      // Before the bookshelf metadata arrives, the raw index already has useful
+      // 主线/活动 categories. Regrouping with an empty StoryLine list would put
+      // everything into 特殊&未分类 and break "cache main story first".
+      if (!metadata?.storylines?.length) return rawIndex;
+      return regroupStoryIndex(rawIndex, metadata.storylines, metadata.fallbackCategory);
+    },
     [rawIndex, metadata]
   );
 

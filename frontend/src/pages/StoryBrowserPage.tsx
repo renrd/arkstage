@@ -9,6 +9,8 @@ import { getReadStories, getLastWatched } from "../lib/readState";
 import type { Book, Shelf } from "../lib/bookshelf";
 import CoverCard from "../components/CoverCard";
 import ChapterDetail from "../components/ChapterDetail";
+import ChapterDirectory from "../components/ChapterDirectory";
+import ReadingTimeline from "../components/ReadingTimeline";
 import SelectionBar from "../components/SelectionBar";
 import { storylineIcon } from "../assets/storylines";
 
@@ -31,6 +33,12 @@ export default function StoryBrowserPage() {
   // `liveBook` resolves it to the full book from the (always-present) index.
   const openCategory = searchParams.get("cat");
   const openCover = searchParams.get("book");
+  type BrowserView = "shelf" | "dir" | "timeline";
+  const rawView = searchParams.get("view");
+  const view: BrowserView =
+    rawView === "dir" || rawView === "timeline" ? rawView : "shelf";
+  const setView = (next: BrowserView) =>
+    setSearchParams(next === "shelf" ? {} : { view: next });
   const openBook: Book | null = useMemo(
     () =>
       openCover
@@ -40,8 +48,12 @@ export default function StoryBrowserPage() {
   );
   // Drill into a book by pushing a history entry; back (hardware or ◀) pops it.
   const openBookCard = useCallback(
-    (book: Book) => setSearchParams({ cat: book.category, book: book.coverKey }),
-    [setSearchParams]
+    (book: Book) => setSearchParams({
+      cat: book.category,
+      book: book.coverKey,
+      ...(view === "shelf" ? {} : { view }),
+    }),
+    [setSearchParams, view]
   );
 
   // On every drill in/out: clear any pending selection so the bottom bar doesn't
@@ -236,14 +248,33 @@ export default function StoryBrowserPage() {
       {!liveBook && (
         <>
           <div className="browser-header">
-            <button className="back-icon" onClick={() => navigate(-1)} aria-label="返回">
-              ◀
-            </button>
-            <h1>剧情书架</h1>
+            <div className="browser-title-row">
+              <button className="back-icon" onClick={() => navigate(-1)} aria-label="返回">
+                ◀
+              </button>
+              <h1>{view === "dir" ? "剧情目录" : view === "timeline" ? "推荐顺序" : "剧情书架"}</h1>
+              <div className="view-switch" role="tablist" aria-label="浏览方式">
+                {([
+                  ["shelf", "书架"],
+                  ["dir", "目录"],
+                  ["timeline", "时间线"],
+                ] as const).map(([value, label]) => (
+                  <button
+                    key={value}
+                    role="tab"
+                    aria-selected={view === value}
+                    className={`view-tab ${view === value ? "on" : ""}`}
+                    onClick={() => setView(value)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <input
               className="search-input"
               type="text"
-              placeholder="搜索书目 / 剧情..."
+              placeholder={view === "shelf" ? "搜索书目 / 剧情..." : "搜索章节 / 活动 / 剧情..."}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
@@ -252,6 +283,26 @@ export default function StoryBrowserPage() {
                 background, so there's no manual refresh button. */}
           </div>
 
+          {view === "dir" ? (
+            <ChapterDirectory
+              shelves={filtered}
+              cachedStories={cachedStories}
+              readStories={readStories}
+              lastWatched={lastWatched}
+              onOpenBook={openBookCard}
+              onPlay={playStory}
+            />
+          ) : view === "timeline" ? (
+            <ReadingTimeline
+              shelves={shelves}
+              cachedStories={cachedStories}
+              readStories={readStories}
+              lastWatched={lastWatched}
+              query={search}
+              onOpenBook={openBookCard}
+              onPlay={playStory}
+            />
+          ) : (
           <div className="browser-content shelf-content">
             {filtered.map((shelf) => (
               <section key={shelf.category} className="shelf">
@@ -304,6 +355,7 @@ export default function StoryBrowserPage() {
 
             {filtered.length === 0 && <div className="loading">未找到剧情</div>}
           </div>
+          )}
         </>
       )}
 

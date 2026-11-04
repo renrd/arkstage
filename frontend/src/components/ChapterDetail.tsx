@@ -1,10 +1,24 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type { Book } from "../lib/bookshelf";
 import { cachedKey } from "../lib/bookshelf";
 import { coverFallback } from "../lib/cover";
 import { useBookshelfMetadata, type ResolvedArt } from "../lib/BookshelfMetadataContext";
 import { useLongPress } from "../lib/useLongPress";
+import { openingForBook } from "../lib/chapterOpenings";
+import { externalOpeningForBook, isMainStoryBook, type ExternalOpening } from "../lib/externalOpenings";
+import { pvListForBook } from "../lib/bilibiliPvCatalog";
+import ChapterOpening from "./ChapterOpening";
+import BilibiliPlayer from "./BilibiliPlayer";
 import type { StoryChapter } from "../hooks/useStoryIndex";
+
+// Per app session: books already checked and confirmed to have no official
+// 活动先导PV. Avoid hitting Bilibili again every time the detail page reopens.
+const noActivityPv = new Set<string>();
+
+const SCROLL_PREFIX = "arkstage-chapter-scroll:";
+const COLLAPSED_PREFIX = "arkstage-chapter-collapsed:";
+const RETURN_PREFIX = "arkstage-chapter-return:";
 
 interface Props {
   book: Book;
@@ -55,9 +69,6 @@ export default function ChapterDetail({
       alive = false;
     };
   }, [book.coverKey, metadata?.version, resolveArt]);
-  // Default: all chapters open.
-  const [collapsed, setCollapsed] = useState<Record<number, boolean>>({});
-
   const isCached = (pt: string) => cachedStories.has(cachedKey(pt));
   const isRead = (pt: string) => readStories.has(pt);
 
@@ -65,6 +76,191 @@ export default function ChapterDetail({
     () => book.pageTitles.filter((pt) => cachedStories.has(cachedKey(pt))).length,
     [book.pageTitles, cachedStories]
   );
+  const readCount = useMemo(
+    () => book.pageTitles.filter((pt) => readStories.has(pt)).length,
+    [book.pageTitles, readStories]
+  );
+
+  // Flatten once so "continue" / "next unread" can jump across chapters.
+  const flatStories = useMemo(
+    () =>
+      book.chapters.flatMap((ch, ci) =>
+        ch.stories.map((story, si) => ({
+          ...story,
+          chapterName: ch.name,
+          chapterIndex: ci,
+          storyIndex: si,
+        }))
+      ),
+    [book.chapters]
+  );
+  const lastStory = useMemo(
+    () => flatStories.find((story) => story.page_title === lastWatched) ?? null,
+    [flatStories, lastWatched]
+  );
+  const nextUnread = useMemo(
+    () => flatStories.find((story) => !isRead(story.page_title)) ?? flatStories[0] ?? null,
+    [flatStories, readStories]
+  );
+
+  // Start with the chapter that contains "last watched" (or the first unread
+  // chapter) open; everything else collapsed. This turns a 4,000px wall into
+  // two or three screenfuls on a phone while keeping the target one tap away.
+  const initialCollapsed = useMemo(() => {
+    const target = lastStory?.chapterIndex
+      ?? nextUnread?.chapterIndex
+      ?? 0;
+    const next: Record<number, boolean> = {};
+    book.chapters.forEach((_, index) => {
+      if (index !== target) next[index] = true;
+    });
+    return next;
+    // readStories is intentionally not a dependency: recomputing the initial
+    // fold after every read would fight the user's manual expand/collapse.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [book.coverKey, lastStory?.chapterIndex, nextUnread?.chapterIndex, book.chapters.length]);
+
+  const scrollKey = `${SCROLL_PREFIX}${book.coverKey}`;
+  const collapsedKey = `${COLLAPSED_PREFIX}${book.coverKey}`;
+  const returnKey = `${RETURN_PREFIX}${book.coverKey}`;
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [returning] = useState(() => {
+    try {
+      return sessionStorage.getItem(returnKey) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [collapsed, setCollapsed] = useState<Record<number, boolean>>(() => {
+    if (returning) {
+      try {
+        const raw = sessionStorage.getItem(collapsedKey);
+        if (raw) return JSON.parse(raw) as Record<number, boolean>;
+      } catch {
+        // fall through to the normal initial fold
+      }
+    }
+    return initialCollapsed;
+  });
+  const [showOpening, setShowOpening] = useState(false);
+  const [biliKeyword, setBiliKeyword] = useState<string | null>(null);
+  const [biliBvid, setBiliBvid] = useState<string | null>(null);
+  const [autoExternal, setAutoExternal] = useState<ExternalOpening | null>(null);
+  const opening = openingForBook(book.coverKey);
+  const isMain = isMainStoryBook(book.coverKey);
+  const curatedPvs = useMemo(() => pvListForBook(book.coverKey), [book.coverKey]);
+  const curatedVideos = useMemo(
+    () => curatedPvs.map((item) => ({ bvid: item.bvid, title: item.title, pv_type: item.type })),
+    [curatedPvs]
+  );
+  const curatedExternal = externalOpeningForBook(book.coverKey);
+
+  // All books get a Bilibili PV entry when one exists: activities use
+  // 活动先导PV, main-story books use 概念PV. Local animations no longer suppress
+  // the Bilibili entry. Unknown/new books are checked once with strict search.
+  useEffect(() => {
+    setAutoExternal(null);
+    if (curatedPvs.length > 0) return;
+    const kind = isMain ? "main" : "activity";
+    const cacheKey = `${kind}:${book.coverKey}`;
+    if (noActivityPv.has(cacheKey)) return;
+    let cancelled = false;
+    void invoke<{ bvid: string; pv_type: string }[]>("bilibili_pv_list", {
+      keyword: book.coverKey,
+      kind,
+    })
+      .then((list) => {
+        if (!cancelled && list.length > 0 && list[0].bvid) {
+          setAutoExternal({
+            bookKey: book.coverKey,
+            title: book.coverKey,
+            bvid: list[0].bvid,
+            kind,
+            label: list[0].pv_type,
+          });
+        } else if (!cancelled) {
+          noActivityPv.add(cacheKey);
+        }
+      })
+      .catch(() => {
+        noActivityPv.add(cacheKey);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [book.coverKey, isMain, curatedPvs]);
+
+  const externalOpening = curatedExternal ?? autoExternal;
+
+  useLayoutEffect(() => {
+    if (!returning) return;
+    const element = scrollRef.current;
+    if (!element) return;
+    let top = 0;
+    try {
+      top = Number(sessionStorage.getItem(scrollKey) ?? 0);
+    } catch {
+      top = 0;
+    }
+    const restore = () => {
+      element.scrollTop = top;
+    };
+    restore();
+    const frame = requestAnimationFrame(() => {
+      restore();
+      requestAnimationFrame(restore);
+    });
+    try {
+      sessionStorage.removeItem(returnKey);
+    } catch {
+      // best-effort
+    }
+    return () => cancelAnimationFrame(frame);
+  }, [returning, scrollKey, returnKey]);
+
+  useEffect(() => {
+    // On a return from the player, keep the exact chapter fold the user had
+    // before entering the story; otherwise auto-fold around last/next unread.
+    if (returning) return;
+    setCollapsed(initialCollapsed);
+  }, [initialCollapsed, returning]);
+
+  const savePosition = () => {
+    const element = scrollRef.current;
+    if (!element) return;
+    try {
+      sessionStorage.setItem(scrollKey, String(element.scrollTop));
+      sessionStorage.setItem(collapsedKey, JSON.stringify(collapsed));
+      sessionStorage.setItem(returnKey, "1");
+    } catch {
+      // best-effort
+    }
+  };
+
+  const playFromList = (pageTitle: string) => {
+    savePosition();
+    onPlay(pageTitle);
+  };
+
+  const allOpen = book.chapters.every((_, index) => !collapsed[index]);
+  const toggleAll = () => {
+    if (allOpen) {
+      const next: Record<number, boolean> = {};
+      book.chapters.forEach((_, index) => { next[index] = true; });
+      setCollapsed(next);
+    } else {
+      setCollapsed({});
+    }
+  };
+  const jumpToChapter = (index: number) => {
+    setCollapsed((prev) => ({ ...prev, [index]: false }));
+    requestAnimationFrame(() => {
+      document.getElementById(`chapter-sec-${index}`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+  };
 
   const chapterState = (ch: StoryChapter): { all: boolean; some: boolean } => {
     const sel = ch.stories.filter((s) => selected.has(s.page_title)).length;
@@ -75,8 +271,34 @@ export default function ChapterDetail({
   // story has no "partial", so no yellow).
   const storyDot = (pt: string) => (isRead(pt) ? "read" : isCached(pt) ? "all" : "");
 
+  const readPct = book.storyCount > 0 ? Math.round((readCount / book.storyCount) * 100) : 0;
+  const hasUnread = flatStories.some((story) => !isRead(story.page_title));
+
   return (
-    <div className="chapter-detail">
+    <div
+      className="chapter-detail"
+      ref={scrollRef}
+      onScroll={(event) => {
+        try {
+          sessionStorage.setItem(scrollKey, String(event.currentTarget.scrollTop));
+        } catch {
+          // best-effort
+        }
+      }}
+    >
+      <div className="detail-sticky">
+        <button className="back-icon" onClick={onBack} aria-label="返回">
+          ◀
+        </button>
+        <div className="detail-sticky-title">
+          <strong>{book.coverKey}</strong>
+          <span>已读 {readCount}/{book.storyCount}</span>
+        </div>
+        <button className="detail-expand" onClick={toggleAll}>
+          {allOpen ? "收起" : "展开全部"}
+        </button>
+      </div>
+
       <div className={`detail-hero ${banner ? "has-banner" : ""}`} style={{ background: fallback.background }}>
         {banner && (
           <img
@@ -97,23 +319,91 @@ export default function ChapterDetail({
           />
         )}
         <div className="hero-scrim" />
-        <button className="hero-back back-icon" onClick={onBack} aria-label="返回">
-          ◀
-        </button>
         <div className="hero-meta">
           <div className="hero-cat">{book.category}</div>
           <h1 className="hero-title">{book.coverKey}</h1>
           <div className="hero-sub">
             {book.chapters.length > 1 ? `${book.chapters.length} 章 · ` : ""}
-            {book.storyCount} 剧情 · 已缓存 {cachedCount}/{book.storyCount}
+            {book.storyCount} 节 · 已读 {readCount} · 已缓存 {cachedCount}
+          </div>
+          <div className="hero-progress" aria-hidden="true">
+            <i style={{ width: `${readPct}%` }} />
+          </div>
+          <div className="hero-actions">
+            {lastStory && (
+              <button
+                className="hero-action primary"
+                onClick={() => playFromList(lastStory.page_title)}
+              >
+                继续上次
+              </button>
+            )}
+            {nextUnread && (
+              <button
+                className="hero-action"
+                onClick={() => playFromList(nextUnread.page_title)}
+              >
+                {hasUnread ? "下一未读" : "从头重读"}
+              </button>
+            )}
+            {opening && (
+              <button className="hero-action opening" onClick={() => setShowOpening(true)}>
+                {opening.buttonLabel}
+              </button>
+            )}
+            {externalOpening && (
+              <button
+                className="hero-action external"
+                onClick={() => {
+                  setBiliKeyword(externalOpening.title);
+                  setBiliBvid(externalOpening.bvid);
+                }}
+              >
+                {externalOpening.label}
+              </button>
+            )}
           </div>
         </div>
       </div>
+
+      {book.chapters.length > 2 && (
+        <div className="chapter-jump" aria-label="章节快速跳转">
+          {book.chapters.map((ch, ci) => (
+            <button
+              key={ci}
+              className="chapter-jump-chip"
+              title={ch.name}
+              onClick={() => jumpToChapter(ci)}
+            >
+              <b>{String(ci + 1).padStart(2, "0")}</b>
+              <span>{ch.name}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {showOpening && opening && (
+        <ChapterOpening opening={opening} onClose={() => setShowOpening(false)} />
+      )}
+
+      {biliKeyword && (
+        <BilibiliPlayer
+          keyword={biliKeyword}
+          bvid={biliBvid}
+          kind={isMain ? "main" : "activity"}
+          videos={curatedVideos}
+          onClose={() => {
+            setBiliKeyword(null);
+            setBiliBvid(null);
+          }}
+        />
+      )}
 
       <div className="detail-body">
         {book.chapters.map((ch, ci) => (
           <Chapter
             key={ci}
+            index={ci}
             chapter={ch}
             open={!collapsed[ci]}
             onToggleOpen={() => setCollapsed((p) => ({ ...p, [ci]: !p[ci] }))}
@@ -124,7 +414,7 @@ export default function ChapterDetail({
             isCached={isCached}
             isRead={isRead}
             storyDot={storyDot}
-            onPlay={onPlay}
+            onPlay={playFromList}
             onToggleStory={onToggleStory}
             onSetMany={onSetMany}
           />
@@ -135,6 +425,7 @@ export default function ChapterDetail({
 }
 
 function Chapter({
+  index,
   chapter: ch,
   open,
   onToggleOpen,
@@ -149,6 +440,7 @@ function Chapter({
   onToggleStory,
   onSetMany,
 }: {
+  index: number;
   chapter: StoryChapter;
   open: boolean;
   onToggleOpen: () => void;
@@ -179,8 +471,10 @@ function Chapter({
   // Long-press the chapter title → select the whole chapter; tap → collapse.
   const headPress = useLongPress(() => onSetMany(titles, true), onToggleOpen);
 
+  const readPct = titles.length > 0 ? Math.round((readCount / titles.length) * 100) : 0;
+
   return (
-    <div className={`detail-chapter ${chRead ? "read" : ""}`}>
+    <div className={`detail-chapter ${chRead ? "read" : ""}`} id={`chapter-sec-${index}`}>
       <div className="dc-head">
         {selectionMode && (
           <button
@@ -194,12 +488,16 @@ function Chapter({
             {st.all ? "✓" : st.some ? "–" : ""}
           </button>
         )}
+        <span className="dc-index">{String(index + 1).padStart(2, "0")}</span>
         <span className={`dc-dot ${chDot}`} />
         <button className="dc-title" {...headPress}>
           <span className={`arrow ${open ? "open" : ""}`}>▶</span>
           <span className="dc-name">{ch.name}</span>
           <span className="dc-count">
-            {readCount > 0 && !chRead ? `已读 ${readCount}/${ch.stories.length}` : `${ch.stories.length} 剧情`}
+            {readCount > 0 && !chRead ? `已读 ${readCount}/${ch.stories.length}` : `${ch.stories.length} 节`}
+          </span>
+          <span className="dc-mini-bar" aria-hidden="true">
+            <i style={{ width: `${readPct}%` }} />
           </span>
         </button>
       </div>
@@ -209,6 +507,7 @@ function Chapter({
           {ch.stories.map((s, si) => (
             <Story
               key={si}
+              index={si}
               title={s.title}
               pageTitle={s.page_title}
               on={selected.has(s.page_title)}
@@ -226,6 +525,7 @@ function Chapter({
 }
 
 function Story({
+  index,
   title,
   pageTitle,
   on,
@@ -235,6 +535,7 @@ function Story({
   onPlay,
   onToggleStory,
 }: {
+  index: number;
   title: string;
   pageTitle: string;
   on: boolean;
@@ -263,6 +564,7 @@ function Story({
           {on ? "✓" : ""}
         </button>
       )}
+      <span className="dc-sindex">{String(index + 1).padStart(2, "0")}</span>
       <span className={`dc-dot ${dot}`} />
       <span className="dc-stitle" title={pageTitle} {...press}>
         {title}

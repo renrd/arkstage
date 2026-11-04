@@ -1,4 +1,5 @@
 mod android_service;
+mod bilibili;
 mod commands;
 mod compress;
 mod data_root;
@@ -324,6 +325,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             playback_cache::ensure_playback_asset,
+            bilibili::bilibili_search,
+            bilibili::bilibili_pv_list,
+            bilibili::bilibili_playurl,
+            bilibili::bilibili_qr_generate,
+            bilibili::bilibili_qr_poll,
+            bilibili::bilibili_session_status,
+            bilibili::bilibili_restore_session,
+            bilibili::bilibili_logout,
             // Wiki fetching
             wiki::fetch_story_index,
             wiki::fetch_story_page,

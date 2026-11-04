@@ -49,6 +49,19 @@ function fmtSpeed(bps: number): string {
   return `${(bps / 1024 / 1024).toFixed(1)} MB/s`;
 }
 
+function fmtBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.max(0, Math.round(bytes / 1024))} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(0)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function fmtEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  if (seconds < 60) return `${Math.ceil(seconds)} 秒`;
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分钟`;
+  return `${(seconds / 3600).toFixed(1)} 小时`;
+}
+
 /** One labelled progress row (label on the left, a thin fill bar on the right). */
 function ProgressRow({ label, pct, dim }: { label: string; pct: number; dim?: boolean }) {
   return (
@@ -184,6 +197,13 @@ export default function DownloadBar() {
   // the "already cached" (skipped) count alongside progress.
   const dlExtra = status.skipped > 0 ? ` 跳过${status.skipped}` : "";
   const dlLabel = `${prefix}下载 ${status.done}/${status.total}${dlExtra}`;
+  // Estimate remaining size/time from the average bytes of completed items. The
+  // backend streams URLs as manifests arrive, so an exact total is unknowable up
+  // front; this is still far more useful than a bare item count.
+  const averageBytes = status.done > 0 ? status.bytes / status.done : 0;
+  const remainingBytes = averageBytes * Math.max(0, status.total - status.done);
+  const etaSeconds = status.bytesPerSec > 0 ? remainingBytes / status.bytesPerSec : 0;
+  const etaText = status.paused ? "" : fmtEta(etaSeconds);
 
   return (
     <div
@@ -206,8 +226,21 @@ export default function DownloadBar() {
         <ProgressRow label={idxLabel} pct={pct(status.manifestDone, status.manifestTotal)} dim={!status.manifestActive} />
         <ProgressRow label={dlLabel} pct={pct(status.done, status.total)} />
       </div>
-      <span style={{ flex: "0 0 auto", minWidth: "64px", textAlign: "right" }}>
-        {status.paused ? "—" : fmtSpeed(status.bytesPerSec)}
+      <span
+        style={{
+          flex: "0 0 auto",
+          minWidth: "92px",
+          textAlign: "right",
+          display: "flex",
+          flexDirection: "column",
+          gap: "1px",
+          lineHeight: 1.2,
+        }}
+      >
+        <b>{status.paused ? "—" : fmtSpeed(status.bytesPerSec)}</b>
+        <small style={{ color: "#b9b19a", fontSize: "10px" }}>
+          {etaText ? `约 ${etaText}` : remainingBytes > 0 ? `剩 ${fmtBytes(remainingBytes)}` : ""}
+        </small>
       </span>
       <button className="nav-btn" style={{ fontSize: "12px" }} onClick={togglePause}>
         {status.paused ? "继续" : "暂停"}

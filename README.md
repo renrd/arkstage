@@ -2,6 +2,8 @@
 
 方舟剧场是一个明日方舟（Arknights）剧情的离线演出回放器。它把 [PRTS Wiki](https://prts.wiki) 的原版演出引擎（ScenarioSimulator）搬进一个跨平台应用里运行，呈现与游戏内一致的立绘、背景、配音与对话动画，并支持预下载后在无网或计费网络环境下完全离线播放。支持 Android 与桌面（Windows / macOS / Linux）。
 
+> **本仓库是修改版 fork**：基于 [djkcyl/arkstage](https://github.com/djkcyl/arkstage)（commit `a4b9ab8`），增加了 B 站 PV 目录/播放、阅读位置恢复、分支续读等改动，详见 [FORK-NOTICE.md](FORK-NOTICE.md) 与 [MODIFICATIONS.md](MODIFICATIONS.md)。本 fork 与原作者、鹰角网络、PRTS Wiki、哔哩哔哩均无隶属或背书关系。
+
 ---
 
 ## ⚠️ 免责声明
@@ -131,7 +133,7 @@
 
 本应用使用并致谢以下上游：ScenarioSimulator 演出引擎（PRTS Wiki）、jQuery、PreloadJS / CreateJS、Tauri、React、React Router、Noto Sans CJK 字体。各组件许可证全文见应用内 **设置 → 关于 → 开源许可**。
 
-项目源码托管于 GitHub：**https://github.com/djkcyl/arkstage** 。仓库当前尚未指定开源许可证，在补充 `LICENSE` 之前默认保留所有权利。
+原项目源码托管于 GitHub：**https://github.com/djkcyl/arkstage** 。原项目与本 fork 均采用 **GNU AGPL-3.0-only**；完整协议见 [LICENSE](LICENSE)，第三方素材/上游引擎的授权边界见 [LICENSE-SCOPE.md](LICENSE-SCOPE.md)。fork 的修改与来源说明见 [FORK-NOTICE.md](FORK-NOTICE.md) 和 [MODIFICATIONS.md](MODIFICATIONS.md)。
 
 ---
 

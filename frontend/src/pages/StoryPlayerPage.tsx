@@ -1,16 +1,26 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { bootEngineInFrame } from "../lib/engineBoot";
 import { loadStoryRuntime } from "../lib/predownload";
 import { setReading } from "../lib/keepalive";
 import { useCompression } from "../lib/CompressionContext";
-import { markRead, setLastWatched } from "../lib/readState";
+import {
+  clearSavedLine,
+  getSavedLine,
+  markRead,
+  saveLine,
+  setLastWatched,
+  type SavedLine,
+} from "../lib/readState";
 import { setLandscape } from "../lib/orientation";
 import { setImmersive } from "../lib/immersive";
 import type { PlayerController } from "../lib/modernEngine";
 import PlayerHUD from "../components/PlayerHUD";
 import { playbackCheckpoint, pushLog } from "../lib/debugLog";
+import { buildTranscript } from "../lib/playerTranscript";
 import { reportLoading, useLoadingProgress } from "../lib/loadingProgress";
+import { useStoryIndex } from "../hooks/useStoryIndex";
+import { buildShelves } from "../lib/bookshelf";
 
 /**
  * Story player page — loads the ORIGINAL PRTS ScenarioSimulator engine via bootEngine().
@@ -29,9 +39,59 @@ export default function StoryPlayerPage() {
   const controllerRef = useRef<PlayerController | null>(null);
   const [controller, setController] = useState<PlayerController | null>(null);
   const [storyScript, setStoryScript] = useState("");
+  const [savedLine, setSavedLine] = useState<SavedLine | null>(null);
+  const [resumeChecked, setResumeChecked] = useState(false);
+  const [resumeDone, setResumeDone] = useState(false);
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const [resumeStatus, setResumeStatus] = useState<string | null>(null);
+  const seekCancelRef = useRef<(() => void) | null>(null);
+  const resumeSettledRef = useRef(false);
 
   const decodedTitle = pageTitle ? decodeURIComponent(pageTitle) : "";
   const { busy: compressionBusy } = useCompression();
+  const { index: storyIndex } = useStoryIndex();
+
+  // Next page in the same book, then the next book in the same shelf. This is
+  // the order shown by the directory, not the curated timeline, so "下一节"
+  // keeps following the chapter the reader actually opened.
+  const nextStory = useMemo(() => {
+    if (!storyIndex || !decodedTitle) return null;
+    const shelves = buildShelves(storyIndex);
+    for (const shelf of shelves) {
+      const bookIndex = shelf.books.findIndex((book) => book.pageTitles.includes(decodedTitle));
+      if (bookIndex < 0) continue;
+      const book = shelf.books[bookIndex];
+      const entryOf = (target: (typeof shelf.books)[number], pageTitle: string) => {
+        for (const chapter of target.chapters) {
+          for (const story of chapter.stories) {
+            if (story.page_title === pageTitle) {
+              return { pageTitle, title: story.title, chapter: chapter.name };
+            }
+          }
+        }
+        return null;
+      };
+      const current = book.pageTitles.indexOf(decodedTitle);
+      if (current >= 0 && current + 1 < book.pageTitles.length) {
+        return entryOf(book, book.pageTitles[current + 1]);
+      }
+      for (const following of shelf.books.slice(bookIndex + 1)) {
+        if (!following.pageTitles.length) continue;
+        const first = entryOf(following, following.pageTitles[0]);
+        if (first) return first;
+      }
+      return null;
+    }
+    return null;
+  }, [storyIndex, decodedTitle]);
+
+  const goToNextStory = () => {
+    if (!nextStory) return;
+    // Replace, don't push: otherwise "退出" from the next section pops back to
+    // the section that just ended. The history entry below the player must stay
+    // the chapter detail the reader originally came from.
+    navigate(`/play/${encodeURIComponent(nextStory.pageTitle)}`, { replace: true });
+  };
 
 
   // Safety net: if a compression batch is active (e.g. the app restarted onto a
@@ -76,6 +136,11 @@ export default function StoryPlayerPage() {
     setError(null);
     setSyncWarning(null);
     setController(null);
+    setSavedLine(null);
+    setResumeChecked(false);
+    setResumeDone(false);
+    setResumeBusy(false);
+    setResumeStatus(null);
 
     (async () => {
       try {
@@ -167,6 +232,140 @@ export default function StoryPlayerPage() {
     };
   }, [decodedTitle]);
 
+  // Once the engine is ready, look up the line checkpoint. Showing the prompt
+  // (instead of auto-resuming) avoids surprising an auto-play user and lets them
+  // deliberately restart.
+  useEffect(() => {
+    if (!controller || resumeChecked) return;
+    setSavedLine(getSavedLine(decodedTitle));
+    setResumeChecked(true);
+  }, [controller, decodedTitle, resumeChecked]);
+
+  const resumeTarget = useMemo(() => {
+    if (!savedLine) return 0;
+    const entries = buildTranscript(storyScript, savedLine.lineIndex);
+    return entries.length ? entries[entries.length - 1].line : savedLine.lineIndex;
+  }, [savedLine, storyScript]);
+
+  const resumePreview = useMemo(() => {
+    if (!savedLine || !storyScript) return null;
+    const entries = buildTranscript(storyScript, resumeTarget);
+    return entries.length ? entries[entries.length - 1] : null;
+  }, [resumeTarget, savedLine, storyScript]);
+
+  // Persist the displayed line on a short interval plus on background/exit.
+  // localStorage is synchronous and tiny; 1.2s is frequent enough that a kill
+  // loses at most a sentence, while not writing on every 80ms frame.
+  useEffect(() => {
+    if (!controller) return;
+    if (savedLine && !resumeDone) return;
+    const persist = () => {
+      try {
+        if (controller.state().state === "finished") {
+          clearSavedLine(decodedTitle);
+          // Once this section is finished, history/continue should point at the
+          // next section, not the one that just ended. If there is no next
+          // section, leave the current one as the last watched.
+          if (nextStory) setLastWatched(nextStory.pageTitle);
+          return;
+        }
+        const position = controller.getPosition();
+        if (position.lineIndex >= 0) {
+          saveLine(decodedTitle, position.lineIndex, position.selections);
+        }
+      } catch {
+        /* checkpoint is best-effort */
+      }
+    };
+    const timer = setInterval(persist, 1200);
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") persist();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", persist);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", persist);
+      persist();
+    };
+  }, [controller, decodedTitle, nextStory, resumeDone, savedLine]);
+
+  useEffect(() => () => seekCancelRef.current?.(), []);
+
+  const startFresh = async () => {
+    clearSavedLine(decodedTitle);
+    setResumeDone(true);
+    setResumeStatus(null);
+    try {
+      await controller?.start();
+    } catch (error) {
+      pushLog("error", "[playback] start failed:", error);
+    }
+  };
+
+  // A saved line can sit exactly on a decision. The engine then stops in
+  // waiting_decision and the seek callback never reports "reached", leaving the
+  // resume overlay stuck on "定位中…" and hiding the choices. Release the
+  // overlay as soon as the engine reaches a decision; the player can choose
+  // normally and the seek continues from there if it can.
+  useEffect(() => {
+    if (!resumeBusy || !controller) return;
+    const timer = setInterval(() => {
+      if (controller.state().state === "waiting_decision") {
+        resumeSettledRef.current = true;
+        setResumeBusy(false);
+        setResumeStatus(null);
+        setResumeDone(true);
+        setSyncWarning("已到分支选择，请选择后继续阅读。");
+      }
+    }, 250);
+    return () => clearInterval(timer);
+  }, [controller, resumeBusy]);
+
+  const resumeFromSaved = async () => {
+    if (!controller || !savedLine) return;
+    setResumeBusy(true);
+    setResumeStatus("正在快进到上次阅读的位置…");
+    try {
+      await controller.start();
+      seekCancelRef.current?.();
+      resumeSettledRef.current = false;
+      seekCancelRef.current = controller.seekToLine(
+        resumeTarget,
+        savedLine.selections,
+        (update) => {
+          if (resumeSettledRef.current) return;
+          if (update.phase === "reached") {
+            resumeSettledRef.current = true;
+            seekCancelRef.current = null;
+            setResumeBusy(false);
+            setResumeStatus(null);
+            setResumeDone(true);
+          } else if (update.phase === "missed" || update.phase === "aborted") {
+            resumeSettledRef.current = true;
+            seekCancelRef.current = null;
+            setResumeBusy(false);
+            setResumeStatus(null);
+            setResumeDone(true);
+            setSyncWarning(
+              update.phase === "aborted"
+                ? "已取消回到上次位置。"
+                : "没有定位到上次的句子（可能是旧版本记录或分支对话），已从头开始播放。"
+            );
+            void controller.start().catch(() => {});
+          }
+        }
+      );
+    } catch (error) {
+      setResumeBusy(false);
+      setResumeStatus(null);
+      setResumeDone(true);
+      pushLog("error", "[playback] resume failed:", error);
+      void controller.start().catch(() => {});
+    }
+  };
+
   // Pop one history level (back to the 章节 detail we came from), so hardware
   // back and this button behave identically.
   const handleBack = () => navigate(-1);
@@ -185,7 +384,41 @@ export default function StoryPlayerPage() {
       {!controller && <button onClick={handleBack} style={backBtnStyle} aria-label="返回" title="返回">◀</button>}
 
       {controller && !loading && (
-        <PlayerHUD controller={controller} script={storyScript} onExit={handleBack} onError={setSyncWarning} />
+        <PlayerHUD
+          controller={controller}
+          script={storyScript}
+          onExit={handleBack}
+          onError={setSyncWarning}
+          next={nextStory}
+          onNext={goToNextStory}
+        />
+      )}
+
+      {controller && !loading && savedLine && !resumeDone && (
+        <div className="resume-overlay" role="dialog" aria-modal="true" aria-labelledby="resume-title">
+          <div className="resume-card">
+            <div className="resume-kicker">上次阅读</div>
+            <h2 id="resume-title">回到上次阅读的位置？</h2>
+            {resumePreview && (
+              <div className="resume-preview">
+                {resumePreview.speaker && <b>{resumePreview.speaker}</b>}
+                <p>{resumePreview.text}</p>
+              </div>
+            )}
+            <p className="resume-hint">
+              退出 App 时会把当前句记在本机，下次可以从这里继续；也可以从头开始。
+            </p>
+            <div className="resume-actions">
+              <button className="resume-primary" onClick={() => void resumeFromSaved()} disabled={resumeBusy}>
+                {resumeBusy ? "定位中…" : "继续上次"}
+              </button>
+              <button className="resume-secondary" onClick={() => void startFresh()} disabled={resumeBusy}>
+                从头开始
+              </button>
+            </div>
+            {resumeStatus && <div className="resume-status">{resumeStatus}</div>}
+          </div>
+        </div>
       )}
 
       {syncWarning && (

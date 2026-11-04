@@ -11,6 +11,7 @@ import { useCompression } from "../lib/CompressionContext";
 import type { Tier, CompressEstimate } from "../lib/CompressionContext";
 import type { StoryIndex } from "../hooks/useStoryIndex";
 import { collectEnvInfo, copyText, collectDiagnosticReport, exportDiagnosticReport } from "../lib/diagnostics";
+import { resetFirstRun } from "../lib/firstRun";
 
 interface CacheStatus {
   story_index_cached: boolean;
@@ -43,7 +44,7 @@ export default function SettingsPage() {
   const [debugConsole, setDebugConsole] = useState(isDebugConsoleEnabled());
   const logFontSize = useLogFontSize();
   // Download tuning: concurrency + bandwidth limit (shown in KB/s; 0 = unlimited).
-  const [concurrency, setConcurrency] = useState(4);
+  const [concurrency, setConcurrency] = useState(16);
   const [rateLimitKbps, setRateLimitKbps] = useState(0);
   const [envInfo, setEnvInfo] = useState("");
 
@@ -272,6 +273,26 @@ export default function SettingsPage() {
             <span style={{ fontSize: "13px", color: "var(--text-secondary)" }}>0 = 不限速</span>
           </div>
         </div>
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "10px" }}>
+          <button className="nav-btn" onClick={() => void saveDownloadSettings(24, 0)}>
+            极速缓存（24 并发）
+          </button>
+          <button className="nav-btn" onClick={() => void saveDownloadSettings(8, 0)}>
+            省电（8 并发）
+          </button>
+          <button
+            className="nav-btn"
+            onClick={() => {
+              resetFirstRun();
+              navigate("/");
+            }}
+          >
+            重新打开缓存向导
+          </button>
+        </div>
+        <p style={{ color: "var(--text-secondary)", fontSize: "13px" }}>
+          全量缓存主要受源站延迟限制，提高并发通常比限速更有效；若出现频繁失败或源站限流，可降到 8–12。
+        </p>
       </div>
 
       {/* Debug console */}

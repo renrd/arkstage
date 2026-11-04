@@ -39,8 +39,19 @@ function graphic(key: Control, width: number, height: number, dx = 0, dy = 0) {
     top: center.y - hit.top - height / 2 + dy, width, height };
 }
 
-export default function PlayerHUD({ controller, script, onExit, onError }: {
-  controller: PlayerController; script: string; onExit: () => void; onError: (error: string) => void;
+export interface NextStoryInfo {
+  pageTitle: string;
+  title: string;
+  chapter: string;
+}
+
+export default function PlayerHUD({ controller, script, onExit, onError, next, onNext }: {
+  controller: PlayerController;
+  script: string;
+  onExit: () => void;
+  onError: (error: string) => void;
+  next?: NextStoryInfo | null;
+  onNext?: () => void;
 }) {
   const surface = useRef<HTMLDivElement>(null);
   const logScroll = useRef<HTMLDivElement>(null);
@@ -97,7 +108,22 @@ export default function PlayerHUD({ controller, script, onExit, onError }: {
         <button className="reader-exit" style={hitbox("btn_skip")} aria-label="退出剧情" onClick={onExit}><span className="reader-mode-label" style={graphic("btn_skip", 77, 31)}>退出<span className="reader-exit-arrow" aria-hidden="true" /></span></button>
       </nav>
       {state.fastForward && <div className="reader-fast-forward" role="status">快进中 ▶▶</div>}
-      {state.state === "finished" && <button className="reader-finished" onClick={onExit}>剧情结束 · 返回书架</button>}
+      {state.state === "finished" && (
+        <div className="reader-finished-panel" role="dialog" aria-label="本节结束">
+          <div className="reader-finished-kicker">本节结束</div>
+          {next && onNext ? (
+            <>
+              <button className="reader-finished-next" onClick={onNext}>
+                下一节 · {next.title}
+              </button>
+              <div className="reader-finished-sub">{next.chapter}</div>
+            </>
+          ) : (
+            <div className="reader-finished-sub">已是本分类的最后一节</div>
+          )}
+          <button className="reader-finished" onClick={onExit}>返回书架</button>
+        </div>
+      )}
     </>}
 
     {panel && <div className="reader-dialog-backdrop" onClick={() => setPanel(null)}>

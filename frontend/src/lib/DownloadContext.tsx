@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { runPredownload, isOfflineError } from "./predownload";
+import { isKnownMissingAsset } from "./knownMissing";
 import type { PredownloadStatus, PredownloadSession } from "./predownload";
 import { useCompression } from "./CompressionContext";
 
@@ -24,7 +25,7 @@ interface DownloadContextValue {
   result: DownloadResult | null;
   dismissResult: () => void;
   /** Start a predownload over the given story page-titles (no-op if one is running). */
-  start: (titles: string[]) => Promise<void>;
+  start: (titles: string[], extraUrls?: string[]) => Promise<void>;
   /** Register a callback fired whenever a run finishes (e.g. to refresh cache lists). */
   onFinished: (cb: () => void) => () => void;
 }
@@ -56,7 +57,7 @@ export function DownloadProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const start = useCallback(async (titles: string[]) => {
+  const start = useCallback(async (titles: string[], extraUrls: string[] = []) => {
     if (runningRef.current || titles.length === 0) return;
     if (compressionBusy) {
       setResult({ message: "正在进行记忆重组（资源压缩），请等待完成后再下载。", failedKeys: [] });
@@ -70,6 +71,7 @@ export function DownloadProvider({ children }: { children: ReactNode }) {
       manifestActive: true,
       done: 0,
       total: 0,
+      bytes: 0,
       success: 0,
       failed: 0,
       skipped: 0,
@@ -77,9 +79,9 @@ export function DownloadProvider({ children }: { children: ReactNode }) {
     });
     setSession(null);
     try {
-      const { cancelled, job } = await runPredownload(titles, setStatus, setSession);
+      const { cancelled, job } = await runPredownload(titles, setStatus, setSession, extraUrls);
       const verb = cancelled ? "已取消" : "完成";
-      const failed = job?.failedKeys ?? [];
+      const failed = (job?.failedKeys ?? []).filter((key) => !isKnownMissingAsset(key));
       // Show new vs. already-cached, and surface any assets that failed after retries
       // (e.g. missing 立绘) so they're diagnosable instead of vanishing into a count.
       const tail = job

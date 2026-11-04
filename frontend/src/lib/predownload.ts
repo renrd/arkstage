@@ -4,7 +4,8 @@ import { bootEngineInFrame, prewarmEngineDeps, refreshEngineDeps } from "./engin
 import type { WidgetBundle } from "./engineBoot";
 import { setManifestProgress } from "./keepalive";
 import { pushLog } from "./debugLog";
-import { modernEngineRevision } from "./modernEngine";
+import { createManifestSession, modernEngineRevision, type ManifestSession } from "./modernEngine";
+import { isKnownMissingAsset } from "./knownMissing";
 import { ENGINE_ADAPTER_VERSION } from "./engineCache";
 import { reportLoading } from "./loadingProgress";
 
@@ -22,6 +23,8 @@ export interface PredownloadStatus {
   // 下载 (download) phase
   done: number;
   total: number; // known assets so far (grows while indexing)
+  /** Bytes downloaded so far (for a live ETA; total is unknowable up front). */
+  bytes: number;
   success: number;
   failed: number;
   skipped: number;
@@ -385,6 +388,16 @@ export async function captureManifest(
   }
 }
 
+/** Manifest capture through a long-lived engine realm (no per-story iframe boot). */
+async function captureManifestWithSession(
+  session: ManifestSession,
+  script: string
+): Promise<string[]> {
+  const urls = await session.manifest(script);
+  if (!urls.length) throw new Error("PRTS 新版引擎未生成资源清单");
+  return urls;
+}
+
 /**
  * Captured asset-URL manifest for one story, **cached** under `manifest_<title>`
  * so we don't re-boot the engine (and don't re-fetch the script) on every
@@ -403,7 +416,8 @@ export async function manifestForStory(
   bundle: WidgetBundle,
   title: string,
   pageRevision?: string,
-  engineAssetsRevision?: string
+  engineAssetsRevision?: string,
+  session?: ManifestSession
 ): Promise<string[]> {
   const key = `manifest_${title.replace(/\//g, "_")}`;
   const script = await ensureScriptRecord(title, pageRevision);
@@ -421,7 +435,19 @@ export async function manifestForStory(
       // Legacy/corrupt manifest is recaptured below.
     }
   }
-  const urls = await captureManifest(bundle, script.script, title);
+  let urls: string[];
+  if (session) {
+    try {
+      urls = await captureManifestWithSession(session, script.script);
+    } catch (error) {
+      // A malformed story can poison a long-lived realm; retry this one in a
+      // disposable iframe so the rest of the library still indexes.
+      pushLog("warn", `[predownload] manifest session failed for ${title}; retrying isolated`, error);
+      urls = await captureManifest(bundle, script.script, title);
+    }
+  } else {
+    urls = await captureManifest(bundle, script.script, title);
+  }
   if (!urls.length) throw new Error(`PRTS 引擎未能为「${title}」生成任何资源清单`);
   const record: ManifestRecord = {
     schemaVersion: 2,
@@ -478,6 +504,32 @@ class PauseGate {
  * engine iframes don't exhaust memory on low-end phones.
  */
 const MANIFEST_CONCURRENCY = 4;
+/** Reusable hidden engine realms; one per manifest worker avoids concurrent use. */
+const MANIFEST_SESSIONS = 4;
+
+async function createManifestSessions(bundle: WidgetBundle): Promise<ManifestSession[]> {
+  if (!bundle.module_engine) return [];
+  const sessions: ManifestSession[] = [];
+  for (let index = 0; index < MANIFEST_SESSIONS; index++) {
+    const iframe = document.createElement("iframe");
+    iframe.style.cssText = "position:fixed;left:-99999px;top:0;width:960px;height:540px;border:0;";
+    document.body.appendChild(iframe);
+    try {
+      sessions.push(await createManifestSession({
+        iframe,
+        bundle,
+        script: "",
+        title: "__arkstage_manifest__",
+        mode: "manifest",
+      }));
+    } catch (error) {
+      iframe.remove();
+      pushLog("warn", "[predownload] persistent manifest session unavailable; falling back", error);
+      break;
+    }
+  }
+  return sessions;
+}
 
 /**
  * How many passes to retry stories whose manifest capture failed before giving up.
@@ -539,7 +591,8 @@ const ZERO_JOB: JobSnapshot = {
 export async function runPredownload(
   titles: string[],
   onStatus: (s: PredownloadStatus) => void,
-  onSession: (s: PredownloadSession) => void
+  onSession: (s: PredownloadSession) => void,
+  extraUrls: string[] = []
 ): Promise<{ cancelled: boolean; job: JobSnapshot | null }> {
   // Tell the native keep-alive about indexing right away (download counts come
   // from the Rust engine; the FGS itself is started by the download_start command).
@@ -559,6 +612,7 @@ export async function runPredownload(
       manifestActive,
       done: dl.done,
       total: dl.total,
+      bytes: dl.bytes,
       success: dl.success,
       failed: dl.failed,
       skipped: dl.skipped,
@@ -575,6 +629,7 @@ export async function runPredownload(
   document.addEventListener("visibilitychange", onVisible);
   await acquireScreenWake();
 
+  let manifestSessions: ManifestSession[] = [];
   try {
     const bundle = await loadBundle();
     // Cache the engine deps once up-front (via Rust) so the parallel iframe boots
@@ -582,6 +637,9 @@ export async function runPredownload(
     if (!bundle.module_engine) await prewarmEngineDeps();
     const engineAssetsRevision = bundle.module_engine
       ? await modernEngineRevision(bundle.module_engine, bundle.metadata_urls) : await refreshEngineDeps();
+    // New StoryPlayer: keep a few realms alive and reuse them for every story.
+    // Booting an iframe per story was the dominant cost of a full-library cache.
+    manifestSessions = await createManifestSessions(bundle);
     const runtimeRevision = `${bundle.revision || "legacy"}|${engineAssetsRevision}`;
     let pageRevisions: Record<string, string> = {};
     try {
@@ -592,7 +650,9 @@ export async function runPredownload(
       console.warn("PRTS revision check failed; switching to per-page validation", error);
     }
     // Open a streaming job (foreground → keep-alive start is allowed).
-    const jobId = await invoke<number>("download_start", { urls: [] });
+    // Chapter-entry movies are outside the AVG manifests; seed them into the
+    // same streaming job so "cache main/all" also makes openings offline-ready.
+    const jobId = await invoke<number>("download_start", { urls: extraUrls });
 
     onSession({
       pause: () => { paused = true; gate.pause(); invoke("download_pause", { jobId }); emit(); },
@@ -643,17 +703,22 @@ export async function runPredownload(
     // concurrently; failures are RETRIED (not dropped) so a momentary background
     // throttle doesn't close the job early with missing assets — it resumes on
     // return to the foreground.
-    const indexOne = async (title: string): Promise<boolean> => {
+    const indexOne = async (title: string, session?: ManifestSession): Promise<boolean> => {
       try {
         const urls = (await manifestForStory(
           bundle,
           title,
           pageRevisions[title],
-          engineAssetsRevision
+          engineAssetsRevision,
+          session
         ))
           // Only real http(s) assets are downloadable; drop data:/blob:/relative
           // URLs the engine emits so they never inflate the total or look failed.
-          .filter((u) => /^https?:\/\//i.test(u));
+          .filter((u) => /^https?:\/\//i.test(u))
+          // Old story snapshots reference 6 images and one audio directory that
+          // PRTS has removed. Dropping them here keeps the final "failed" list
+          // meaningful (a real asset regression still shows up).
+          .filter((u) => !isKnownMissingAsset(u));
         await invoke("download_add", { jobId, urls });
         indexed++;
         manifestDone = cachedCount + indexed;
@@ -670,19 +735,25 @@ export async function runPredownload(
     const runPass = async (items: string[]): Promise<string[]> => {
       const failed: string[] = [];
       let next = 0;
-      const worker = async (): Promise<void> => {
+      const worker = async (workerIndex: number): Promise<void> => {
+        const session = manifestSessions.length
+          ? manifestSessions[workerIndex % manifestSessions.length]
+          : undefined;
         for (;;) {
           await gate.wait();
           if (gate.cancelled) { cancelled = true; return; }
           if (offlineErr) return;
           const k = next++;
           if (k >= items.length) return;
-          const ok = await indexOne(items[k]);
+          const ok = await indexOne(items[k], session);
           if (!ok && !gate.cancelled && !offlineErr) failed.push(items[k]);
         }
       };
       await Promise.all(
-        Array.from({ length: Math.min(MANIFEST_CONCURRENCY, items.length) }, worker)
+        Array.from(
+          { length: Math.min(MANIFEST_CONCURRENCY, items.length) },
+          (_, index) => worker(index)
+        )
       );
       return failed;
     };
@@ -718,6 +789,10 @@ export async function runPredownload(
   } finally {
     document.removeEventListener("visibilitychange", onVisible);
     releaseScreenWake();
+    // Persistent engines are only useful for this run; leaving them alive would
+    // pin Pixi/module memory for the rest of the session.
+    manifestSessions.forEach((session) => session.dispose());
+    manifestSessions = [];
     // Indexing is over; clear its counts. The engine clears the download state on
     // the job's terminal snapshot, which drops the service to "reading" or stops it.
     setManifestProgress(0, 0, false);
