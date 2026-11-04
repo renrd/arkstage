@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import QRCode from "qrcode";
 import { invoke } from "@tauri-apps/api/core";
+import { isAndroid } from "../lib/platform";
 
 interface Props {
   onClose: () => void;
@@ -34,7 +35,10 @@ export default function BilibiliLogin({ onClose, onSuccess }: Props) {
   const [status, setStatus] = useState("正在生成 B 站登录请求…");
   const [error, setError] = useState<string | null>(null);
   const [expired, setExpired] = useState(false);
-  const [mode, setMode] = useState<"app" | "qr">("app");
+  const mobile = isAndroid();
+  // bilibili:// only exists on Android. Desktop starts in QR mode so the
+  // login card is usable without a missing-app deep link.
+  const [mode, setMode] = useState<"app" | "qr">(mobile ? "app" : "qr");
 
   const generate = async () => {
     setError(null);
@@ -46,7 +50,7 @@ export default function BilibiliLogin({ onClose, onSuccess }: Props) {
       const dataUrl = await QRCode.toDataURL(info.url, { width: 220, margin: 1 });
       setQr(info);
       setImage(dataUrl);
-      setStatus("点下面的按钮，在 B 站 App 里确认登录");
+      setStatus(mobile ? "点下面的按钮，在 B 站 App 里确认登录" : "请用手机 B 站 App 扫码登录");
     } catch (reason) {
       setError(String(reason));
       setStatus("");
@@ -73,7 +77,7 @@ export default function BilibiliLogin({ onClose, onSuccess }: Props) {
         }
         if (result.status === 86090) setStatus("已确认，正在返回本 App…");
         else if (result.status === 86101) {
-          setStatus(mode === "app" ? "等待在 B 站 App 中确认…" : "等待扫码…");
+          setStatus(mode === "app" && mobile ? "等待在 B 站 App 中确认…" : "等待扫码…");
         } else if (result.status === 86038) {
           stopped = true;
           clearInterval(timer);
@@ -113,16 +117,18 @@ export default function BilibiliLogin({ onClose, onSuccess }: Props) {
         </div>
 
         <div className="bili-login-tabs">
-          <button className={mode === "app" ? "on" : ""} onClick={() => setMode("app")}>
-            B站 App 确认
-          </button>
+          {mobile && (
+            <button className={mode === "app" ? "on" : ""} onClick={() => setMode("app")}>
+              B站 App 确认
+            </button>
+          )}
           <button className={mode === "qr" ? "on" : ""} onClick={() => setMode("qr")}>
             扫码登录
           </button>
         </div>
 
         <div className="bili-login-body">
-          {mode === "app" ? (
+          {mode === "app" && mobile ? (
             <>
               <div className="bili-app-icon" aria-hidden="true">B</div>
               <p className="bili-app-copy">

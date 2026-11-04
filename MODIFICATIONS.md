@@ -36,6 +36,16 @@ official bilibili PV archive usable inside the reader.
 - Chapter-directory and chapter-detail scroll positions, category filters, and
   chapter fold state are persisted across opening a book/player and returning.
 
+## Desktop (Windows)
+
+- Desktop builds start bilibili login in QR mode; the Android-only
+  `bilibili://` app-confirmation flow is hidden on desktop.
+- Release logging on Windows is file-only. Tauri's stdout log sink panics with
+  fern when a GUI app loses its console pipe (os error 232), which could close
+  the desktop app during normal use.
+- WebView2's user-data folder is pinned to the ASCII app-data directory before
+  the first window, avoiding access-denied failures on some installs.
+
 ## UI and media
 
 - Custom chapter-opening player with delayed UI hiding and CSS full-screen

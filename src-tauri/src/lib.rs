@@ -118,6 +118,20 @@ fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebView2 can fail with "access denied" when its default user-data folder
+    // ends up beside an executable stored under a non-ASCII path. Pin it to the
+    // ASCII app-data directory before the runtime creates the first window.
+    #[cfg(windows)]
+    {
+        if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+            let base = std::env::var_os("LOCALAPPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = base.join("cn.aunly.arkstage").join("WebView2");
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir);
+        }
+    }
     tauri::Builder::default()
         .register_asynchronous_uri_scheme_protocol("prts-cdn", |_app, request, responder| {
             let responder = protocol::guard(responder, request.uri().to_string());
@@ -303,18 +317,27 @@ pub fn run() {
                 }
             }
             diagnostics::init();
+            #[allow(unused_mut)]
+            let mut log_targets = vec![tauri_plugin_log::Target::new(
+                tauri_plugin_log::TargetKind::Folder {
+                    path: data_root::data_root().join("logs"),
+                    file_name: Some("runtime".into()),
+                },
+            )];
+            // Windows GUI apps have no console. Logging to stdout/stderr there
+            // panics fern once the parent pipe closes (os error 232), which can
+            // close the whole desktop app during normal use. Keep file logging
+            // in release; enable the console sink only for debug builds.
+            #[cfg(debug_assertions)]
+            log_targets.push(tauri_plugin_log::Target::new(
+                tauri_plugin_log::TargetKind::Stdout,
+            ));
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     .level(log::LevelFilter::Info)
                     .max_file_size(512 * 1024)
                     .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
-                    .targets([
-                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
-                            path: data_root::data_root().join("logs"),
-                            file_name: Some("runtime".into()),
-                        }),
-                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                    ])
+                    .targets(log_targets)
                     .build(),
             )?;
             // Register the managed download engine (bulk predownload jobs).
