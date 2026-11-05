@@ -395,8 +395,15 @@ export async function bootModernEngineInFrame(opts: FrameBootOptions): Promise<F
   };
   let removeContextListener = watchContext();
   let uiVisible = true;
+  let seekingLine = false;
   let modes = createPlaybackModes(player);
-  let releaseLineListener = player.onDisplayedLineChange?.(() => modes.reconcile());
+  const reconcileModes = () => {
+    // Re-applying the auto-play mode during a seek calls the engine's
+    // setAutoPlayMode, which aborts an active seekToLine. Let the seek own the
+    // playback mode until it reaches or misses the saved line.
+    if (!seekingLine) modes.reconcile();
+  };
+  let releaseLineListener = player.onDisplayedLineChange?.(reconcileModes);
   const controller: PlayerController = {
     async start() {
       host.querySelector("[data-start-prompt]")?.remove();
@@ -424,11 +431,22 @@ export async function bootModernEngineInFrame(opts: FrameBootOptions): Promise<F
         onUpdate({ phase: "missed", reason: "unsupported" });
         return () => {};
       }
-      return player.seekToLine(
+      seekingLine = true;
+      const cancel = player.seekToLine(
         target,
         new Map(choices.map((choice) => [choice.decisionId, choice.optionIndex])),
-        onUpdate
+        (update) => {
+          if (update.phase !== "seeking") {
+            seekingLine = false;
+            if (update.phase === "reached") modes.reconcile();
+          }
+          onUpdate(update);
+        }
       );
+      return () => {
+        seekingLine = false;
+        cancel();
+      };
     },
     async reset() {
       await checkpoint("reset");
@@ -437,8 +455,9 @@ export async function bootModernEngineInFrame(opts: FrameBootOptions): Promise<F
       removeContextListener();
       player.destroy(); host.replaceChildren(); player = bridge.createPlayer(context);
       modes = createPlaybackModes(player);
+      seekingLine = false;
       await player.mount(host);
-      releaseLineListener = player.onDisplayedLineChange?.(() => modes.reconcile());
+      releaseLineListener = player.onDisplayedLineChange?.(reconcileModes);
       removeContextListener = watchContext();
       showStartPrompt();
     },
