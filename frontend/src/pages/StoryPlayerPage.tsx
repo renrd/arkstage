@@ -241,17 +241,16 @@ export default function StoryPlayerPage() {
     setResumeChecked(true);
   }, [controller, decodedTitle, resumeChecked]);
 
-  const resumeTarget = useMemo(() => {
-    if (!savedLine) return 0;
-    const entries = buildTranscript(storyScript, savedLine.lineIndex);
-    return entries.length ? entries[entries.length - 1].line : savedLine.lineIndex;
-  }, [savedLine, storyScript]);
+  // displayedLineIndex is already the engine's exact source line. Do not remap
+  // it through buildTranscript: that mapped the saved line to the previous
+  // visible text line and made the seek land one sentence early.
+  const resumeTarget = savedLine ? savedLine.lineIndex : 0;
 
   const resumePreview = useMemo(() => {
     if (!savedLine || !storyScript) return null;
-    const entries = buildTranscript(storyScript, resumeTarget);
+    const entries = buildTranscript(storyScript, savedLine.lineIndex);
     return entries.length ? entries[entries.length - 1] : null;
-  }, [resumeTarget, savedLine, storyScript]);
+  }, [savedLine, storyScript]);
 
   // Persist the displayed line on a short interval plus on background/exit.
   // localStorage is synchronous and tiny; 1.2s is frequent enough that a kill
