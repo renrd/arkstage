@@ -6,8 +6,11 @@ interface MusicAudio {
   musicAudio: Playback | null;
   soundCache: Map<string, MusicSound>;
   soundChannels?: Map<string, Playback>;
+  musicBaseVolume: number;
   getSound(url: string): Promise<MusicSound | null>;
   createPlayback(url: string, identity: string): Promise<Playback | null>;
+  playPlayback(playback: Playback, options: unknown): Promise<unknown>;
+  playMusic(request: Record<string, unknown>): Promise<void>;
   stopMusic(fadeMs: number): Promise<void>;
   destroy(): void;
 }
@@ -15,7 +18,26 @@ interface MusicAudio {
 /** Self-contained: its source is installed into the isolated engine realm. */
 export function installMusicContinuity(prototype: MusicAudio, unload: (url: string) => Promise<unknown>): void {
   const getSound = prototype.getSound, createPlayback = prototype.createPlayback;
+  const playPlayback = prototype.playPlayback, playMusic = prototype.playMusic;
   const stopMusic = prototype.stopMusic, destroy = prototype.destroy;
+  // BGM intros on Android WebView can be far more bass-heavy than the loop.
+  // Do not crossfade tracks (overlap adds/clips low end), and keep the intro
+  // 25% below the loop level. Voice and sound effects use other channels and
+  // are untouched.
+  prototype.playMusic = function (request) {
+    if (!request || typeof request !== "object") return playMusic.call(this, request);
+    return playMusic.call(this, { ...request, crossfadeMs: 0 });
+  };
+  prototype.playPlayback = async function (playback, options) {
+    const instance = await playPlayback.call(this, playback, options);
+    if (instance && this.musicAudio === playback && playback.identity.includes("\n")) {
+      const audio = instance as { volume?: number };
+      if (typeof audio.volume === "number") {
+        audio.volume = Math.min(audio.volume, Math.max(0, this.musicBaseVolume) * 0.75);
+      }
+    }
+    return instance;
+  };
   type State = {
     pending: Map<string, Promise<MusicSound | null>>;
     evicting: Map<string, Promise<unknown>>;
