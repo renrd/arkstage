@@ -328,6 +328,10 @@ export default function StoryPlayerPage() {
     setResumeStatus("正在快进到上次阅读的位置…");
     try {
       await controller.start();
+      // Quick-seek restores the previous autoplay mode when it lands. If auto
+      // play was on, that would immediately advance past the saved sentence;
+      // resume should always stop on the saved line in manual mode.
+      controller.setAuto(false);
       seekCancelRef.current?.();
       resumeSettledRef.current = false;
       seekCancelRef.current = controller.seekToLine(
@@ -338,6 +342,7 @@ export default function StoryPlayerPage() {
           if (update.phase === "reached") {
             resumeSettledRef.current = true;
             seekCancelRef.current = null;
+            controller.setAuto(false);
             setResumeBusy(false);
             setResumeStatus(null);
             setResumeDone(true);
