@@ -26,6 +26,7 @@ export function installMusicContinuity(prototype: MusicAudio, unload: (url: stri
   // are untouched.
   prototype.playMusic = function (request) {
     if (!request || typeof request !== "object") return playMusic.call(this, request);
+    introGains.set(this, introGainFor(request.intro));
     return playMusic.call(this, { ...request, crossfadeMs: 0 });
   };
   prototype.playPlayback = async function (playback, options) {
@@ -33,8 +34,12 @@ export function installMusicContinuity(prototype: MusicAudio, unload: (url: stri
     if (instance && this.musicAudio === playback && playback.identity.includes("\n")) {
       const audio = instance as { volume?: number };
       if (typeof audio.volume === "number") {
-        audio.volume = Math.min(audio.volume, Math.max(0, this.musicBaseVolume) * 0.75);
+        audio.volume = Math.min(
+          audio.volume,
+          Math.max(0, this.musicBaseVolume) * (introGains.get(this) ?? 0.75)
+        );
       }
+      introGains.delete(this);
     }
     return instance;
   };
@@ -47,6 +52,13 @@ export function installMusicContinuity(prototype: MusicAudio, unload: (url: stri
     timer?: ReturnType<typeof setTimeout>;
   };
   const states = new WeakMap<MusicAudio, State>();
+  // Per-intro ceiling. The 10-14 opening's nervous_intro is exceptionally
+  // sub-bass heavy on Android; keep it well below the normal intro ceiling so
+  // it cannot physically hurt, while leaving its loop and every voice/SFX
+  // channel untouched.
+  const introGains = new WeakMap<MusicAudio, number>();
+  const introGainFor = (intro: unknown): number =>
+    String(intro ?? "").includes("nervous_intro") ? 0.2 : 0.75;
   function state(audio: MusicAudio): State {
     let value = states.get(audio);
     if (!value) {
