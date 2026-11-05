@@ -472,7 +472,7 @@ export async function bootModernEngineInFrame(opts: FrameBootOptions): Promise<F
       if (panel) panel.renderable = visible;
     },
     async skip() { if (player.canSkipNode()) await player.skipNode(); },
-    state() { return { state: player.getState(), ...modes.state(), line: player.getDisplayedLineIndex(), canSkip: player.canSkipNode() }; },
+    state() { return { state: player.getState(), ...modes.state(!seekingLine), line: player.getDisplayedLineIndex(), canSkip: player.canSkipNode() }; },
     dispose() {
       void playbackCheckpoint(opts.title, "disposed");
       input.dispose(); releaseLineListener?.();

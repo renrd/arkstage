@@ -35,8 +35,11 @@ export function createPlaybackModes(player: ModePlayer) {
       }
       return held;
     },
-    state() {
-      reconcile();
+    state(reconcileMode = true) {
+      // The HUD polls state() continuously. During a line seek the engine is
+      // intentionally in quick_play; reconciling here calls setAutoPlayMode and
+      // aborts the seek. Callers that own a seek pass false.
+      if (reconcileMode) reconcile();
       const native = player.getAutoPlayState();
       return { auto: held ? normal === "button_auto" : native.mode === "button_auto", fastForward: held && native.mode === "quick_play", speed: native.buttonSpeedLevel + 1 };
     },
